@@ -1,5 +1,7 @@
 // Claude Limits — pixel Claude in the menu bar; click for a glass pop-up with your usage limits.
 // Data comes from claude.ai through a hidden web view (sign in once via "Usage page").
+// The crab dances while Claude is working anywhere on this Mac: it watches how many bytes arrive
+// from Anthropic's servers (never their content) and waits still when nothing is streaming.
 import Cocoa
 import SwiftUI
 import WebKit
@@ -18,6 +20,8 @@ final class Model: ObservableObject {
     @Published var scoped: [Scoped] = []   // per-model weekly limits, e.g. Fable
     @Published var signedIn = true
     @Published var frame = 0
+    @Published var blink = false
+    @Published var working = false
 
     var mood: Mascot.Mood {
         guard signedIn else { return .off }
@@ -26,6 +30,7 @@ final class Model: ObservableObject {
     }
 
     var caption: String {
+        if working && signedIn { return "Claude is working…" }
         switch mood {
         case .chill: return "Plenty left. Vibing."
         case .awake: return "Getting busy."
@@ -62,10 +67,10 @@ enum Mascot {
         (0, 0, false, false), (-8, -1, false, true), (0, 0.5, false, false), (0, 0, true, false),
     ]
 
-    static func image(_ mood: Mood, pixel p: CGFloat, frame: Int = 0) -> NSImage {
+    static func image(_ mood: Mood, pixel p: CGFloat, frame: Int = 0, blink: Bool = false) -> NSImage {
         var g = base.map { Array($0) }
         switch mood {
-        case .chill, .off:                       // eyes closed
+        case _ where blink, .chill, .off:        // eyes closed
             for c in [4, 5, 10, 11] { g[5][c] = "k" }
         case .awake, .stressed:                  // eyes open
             for r in [4, 5] { g[r][5] = "k"; g[r][10] = "k" }
@@ -155,7 +160,7 @@ struct PopupView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(spacing: 12) {
-                Image(nsImage: Mascot.image(model.mood, pixel: 3, frame: model.frame))
+                Image(nsImage: Mascot.image(model.mood, pixel: 3, frame: model.frame, blink: model.blink))
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Claude limits").font(.headline)
                     Text(model.caption).font(.caption).foregroundStyle(.secondary)
@@ -183,12 +188,90 @@ struct PopupView: View {
     }
 }
 
+// MARK: - Claude activity
+
+// Watches every TCP and UDP (QUIC) connection to Anthropic (claude.ai, the API, Claude Code, Claude Design, the desktop
+// app, any browser) with nettop, once a second. A streaming reply feeds one connection every second;
+// idle traffic (heartbeats, polling) arrives in single blips, so "busy in 3 of the last 4 seconds" means working.
+final class ActivityMonitor {
+    static let window = 4, needed = 3       // seconds looked at, busy seconds required
+    static let minBytes = 20                // bytes in a second that count as busy (thinking pings are ~40)
+    static let linger: TimeInterval = 10    // keep dancing through pauses (tool runs, file edits)
+    static let debug = CommandLine.arguments.contains("--debug")  // logs each sample to the log file
+
+    var onChange: ((Bool) -> Void)?
+    var debugLog: ((String) -> Void)?
+    var quietUntil = Date.distantPast       // ignore our own claude.ai requests
+    private var history: [String: [Bool]] = [:]   // per connection, busy flag for the last `window` seconds
+    private var current: [String: Int] = [:]
+    private var buffer = "", proc = ""
+    private var samples = 0
+    private var lastActive = Date.distantPast
+    private var working = false
+
+    func start() {
+        let p = Process()
+        // `script` gives nettop a terminal, so it prints every second instead of buffering.
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/script")
+        p.arguments = ["-q", "/dev/null", "/usr/bin/nettop",
+                       "-n", "-x", "-d", "-s", "1", "-L", "0", "-J", "bytes_in"]
+        let pipe = Pipe()
+        p.standardInput = FileHandle.nullDevice
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        pipe.fileHandleForReading.readabilityHandler = { [weak self] h in
+            let text = String(decoding: h.availableData, as: UTF8.self)
+            DispatchQueue.main.async { self?.consume(text) }
+        }
+        p.terminationHandler = { [weak self] _ in   // restart if nettop ever exits
+            pipe.fileHandleForReading.readabilityHandler = nil
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { self?.samples = 0; self?.start() }
+        }
+        try? p.run()
+    }
+
+    private func consume(_ text: String) {
+        buffer += text.replacingOccurrences(of: "\r", with: "")   // the terminal ends lines with \r\n
+        while let nl = buffer.firstIndex(of: "\n") {
+            let line = buffer[..<nl]
+            buffer.removeSubrange(...nl)
+            if line.hasPrefix(",bytes_in") {            // header: a new one-second sample starts
+                if samples > 1 { finishSample() }       // sample 1 holds totals, not deltas
+                samples += 1
+                current = [:]
+                continue
+            }
+            let parts = line.split(separator: ",", omittingEmptySubsequences: false)
+            guard line.hasPrefix("tcp") || line.hasPrefix("udp") else { proc = String(parts.first ?? ""); continue }
+            guard line.contains("<->160.79.10") || line.contains("<->2607:6bc0:"),
+                  parts.count > 1, let bytes = Int(parts[1]) else { continue }
+            current[proc + parts[0], default: 0] += bytes
+        }
+    }
+
+    private func finishSample() {
+        for key in Set(history.keys).union(current.keys) {
+            var h = (history[key] ?? []) + [(current[key] ?? 0) >= Self.minBytes]
+            h = Array(h.suffix(Self.window))
+            history[key] = h.contains(true) ? h : nil
+        }
+        let streaming = history.values.contains { $0.filter { $0 }.count >= Self.needed }
+        if streaming && Date() > quietUntil { lastActive = Date() }
+        let now = Date().timeIntervalSince(lastActive) < Self.linger
+        if Self.debug { debugLog?("bytes=\(current.values.reduce(0, +)) streaming=\(streaming) working=\(now)") }
+        if now != working { working = now; onChange?(now) }
+    }
+}
+
 // MARK: - App
 
 final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     let model = Model()
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let popover = NSPopover()
+    let activity = ActivityMonitor()
+    var idleTicks = 0
+    var drawnIcon = ""
     var window: NSWindow!
     var web: WKWebView!
 
@@ -230,26 +313,48 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         updateButton()
 
         Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in self?.refresh() }
+        activity.onChange = { [weak self] working in self?.model.working = working }
+        activity.debugLog = { [weak self] in self?.log($0) }
+        activity.start()
         scheduleDance()
         if CommandLine.arguments.contains("--show") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.togglePopup() }
         }
     }
 
-    // Dances faster the closer you are to a limit; stands still when signed out.
+    // Dances while Claude is working, faster the closer you are to a limit; otherwise waits and blinks.
     func scheduleDance() {
-        let delay: Double = switch model.mood {
-        case .chill: 0.3
-        case .awake: 0.2
-        case .stressed: 0.12
-        case .off: 1.0
+        var delay = 0.5
+        if model.working && model.mood != .off {
+            delay = switch model.mood {
+            case .stressed: 0.12
+            case .awake: 0.2
+            default: 0.3
+            }
+            model.frame += 1
+        } else {
+            if model.frame != 0 { model.frame = 0 }
+            idleTicks += 1
+            if idleTicks % 9 == 0 { blink() }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self else { return }
-            self.model.frame += 1
-            self.item.button?.image = Mascot.image(self.model.mood, pixel: 1.4, frame: self.model.frame)
-            self.scheduleDance()
+        drawIcon()
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in self?.scheduleDance() }
+    }
+
+    func blink() {
+        model.blink = true
+        drawIcon()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            self?.model.blink = false
+            self?.drawIcon()
         }
+    }
+
+    func drawIcon() {
+        let key = "\(model.mood)\(model.frame % Mascot.dance.count)\(model.blink)"
+        guard key != drawnIcon else { return }
+        drawnIcon = key
+        item.button?.image = Mascot.image(model.mood, pixel: 1.4, frame: model.frame, blink: model.blink)
     }
 
     @objc func togglePopup() {
@@ -276,7 +381,7 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     }
 
     func updateButton() {
-        item.button?.image = Mascot.image(model.mood, pixel: 1.4, frame: model.frame)
+        drawIcon()
         if model.signedIn, let s = model.session, let w = model.week {
             item.button?.title = " \(Int(s.pct.rounded()))% · \(Int(w.pct.rounded()))%"
         } else {
@@ -287,6 +392,11 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     // Refresh whenever a claude.ai page finishes loading (e.g. right after sign-in).
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { refresh() }
 
+    // Our own page loads come from claude.ai too; keep them from counting as Claude working.
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        activity.quietUntil = Date().addingTimeInterval(10)
+    }
+
     func log(_ msg: String) {
         let line = "\(Date()) \(msg)\n"
         let url = URL(fileURLWithPath: NSHomeDirectory() + "/Library/Logs/ClaudeLimits.log")
@@ -296,6 +406,7 @@ final class App: NSObject, NSApplicationDelegate, WKNavigationDelegate {
 
     @objc func refresh() {
         guard web.url?.host == "claude.ai" else { return }
+        activity.quietUntil = max(activity.quietUntil, Date().addingTimeInterval(6))
         // Try the active organization first, then any other one that has usage.
         let js = """
         const orgs = await (await fetch('/api/organizations')).json();
